@@ -51,19 +51,23 @@ export const UploadForm: React.FC<UploadFormProps> = ({ onSuccess }) => {
   };
 
   return (
-    <form className="space-y-4" onSubmit={handleSubmit}>
+    <form className="space-y-4" onSubmit={handleSubmit} encType="multipart/form-data">
       <div>
-        <label className="block text-sm font-medium">Master PDF</label>
-        <input type="file" accept="application/pdf" ref={masterRef} required className="mt-1" />
+        <label className="block text-sm font-semibold text-gray-900">Master PDF</label>
+        <input type="file" accept="application/pdf" ref={masterRef} required className="mt-1 text-gray-900" />
       </div>
       <div>
-        <label className="block text-sm font-medium">Business PDF</label>
-        <input type="file" accept="application/pdf" ref={businessRef} required className="mt-1" />
+        <label className="block text-sm font-semibold text-gray-900">Business PDF</label>
+        <input type="file" accept="application/pdf" ref={businessRef} required className="mt-1 text-gray-900" />
       </div>
-      {error && <div className="text-red-500 text-sm" role="alert">{error} <button type="button" className="underline ml-2" onClick={() => setError(null)}>Retry</button></div>}
-      <button type="submit" className="btn btn-primary" disabled={loading} aria-busy={loading} aria-disabled={loading}>
-        {loading ? 'Uploading…' : 'Upload'}
+      {error && <div className="text-red-700 text-sm font-semibold">{error}</div>}
+      <button
+        type="submit"
+        className="w-full py-3 text-lg bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow focus:outline-none focus:ring-2 focus:ring-blue-400 transition"
+        disabled={loading}
+      >
+        {loading ? 'Uploading...' : 'Upload'}
       </button>
     </form>
   );
-};
+}

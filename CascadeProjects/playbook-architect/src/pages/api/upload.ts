@@ -1,11 +1,10 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import type { File as FormidableFile, Fields, Files } from 'formidable';
-const formidable = require('formidable');
-import { parsePdf } from '../../../backend/services/pdfService';
-import { indexText } from '../../../backend/workers/index';
-import { supabase } from '../../../backend/services/supabaseClient';
-import { v4 as uuidv4 } from 'uuid';
+import formidable, { File } from 'formidable';
 import fs from 'fs';
+import supabaseServiceRole from '../../lib/supabaseServiceRole';
+import OpenAI from 'openai';
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 export const config = {
   api: {
@@ -13,63 +12,78 @@ export const config = {
   },
 };
 
-function fileToBuffer(file: FormidableFile): Promise<Buffer> {
+async function parseForm(req: NextApiRequest): Promise<{ fields: formidable.Fields; files: formidable.Files }> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    if (file.filepath) {
-      const stream = fs.createReadStream(file.filepath);
-      stream.on('data', (chunk: Buffer | string) => {
-        if (Buffer.isBuffer(chunk)) {
-          chunks.push(chunk);
-        } else {
-          chunks.push(Buffer.from(chunk));
-        }
-      });
-      stream.on('end', () => resolve(Buffer.concat(chunks)));
-      stream.on('error', reject);
-    } else if (file.toBuffer) {
-      file.toBuffer().then((buf: Buffer) => resolve(buf)).catch(reject);
-    } else {
-      reject(new Error('No valid file source'));
-    }
+    const form = formidable({
+      multiples: false,
+      filename: (name, ext, part, form) => {
+        // Use the original filename (with extension) if available
+        return part.originalFilename || `${name}${ext}`;
+      }
+    });
+    form.parse(req, (err: Error | null, fields: formidable.Fields, files: formidable.Files) => {
+      if (err) reject(err);
+      else resolve({ fields, files });
+    });
   });
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (req.method !== 'POST') return res.status(405).end();
-  const form = new formidable.IncomingForm();
-  form.parse(req, async (err: any, fields: Fields, files: Files) => {
-    if (err) return res.status(500).json({ error: 'File upload error' });
-    const userId = (fields.userId as string) || 'demo-user';
-    const masterFile = files.master as FormidableFile;
-    const businessFile = files.business as FormidableFile;
-    if (!userId || !masterFile || !businessFile) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-    // Upload files to Supabase Storage
-    const uploadAndProcess = async (file: FormidableFile, type: string) => {
-      const fileBuffer = await fileToBuffer(file);
-      const filePath = `${userId}/${uuidv4()}-${type}.pdf`;
-      await supabase.storage.from('playbooks').upload(filePath, fileBuffer, { contentType: 'application/pdf' });
-      const { data: docInsert } = await supabase.from('documents').insert({
-        user_id: userId,
-        file_path: filePath,
-        type,
-      }).select().single();
-      // Download back, extract text, index
-      const { data: pdfData } = await supabase.storage.from('playbooks').download(filePath);
-      if (pdfData) {
-        const sections = await parsePdf(Buffer.from(await pdfData.arrayBuffer()));
-        await indexText(docInsert.id, sections);
-      }
-      return docInsert;
-    };
-    try {
-      const masterDoc = await uploadAndProcess(masterFile, 'master');
-      const businessDoc = await uploadAndProcess(businessFile, 'business');
-      res.status(200).json({ master: masterDoc, business: businessDoc });
-    } catch (e) {
-      res.status(500).json({ error: 'Processing failed' });
-    }
+async function uploadToOpenAI(file: File) {
+  const fileStream = fs.createReadStream(file.filepath);
+  const upload = await openai.files.create({
+    file: fileStream,
+    purpose: 'assistants',
   });
+  return upload.id;
 }
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { files } = await parseForm(req);
+    // Support both array and single file
+    const masterFile = Array.isArray(files.master) ? files.master[0] : files.master as File;
+    const businessFile = Array.isArray(files.business) ? files.business[0] : files.business as File;
+    if (!masterFile || !businessFile) {
+      return res.status(400).json({ error: 'Both master and business PDFs are required.' });
+    }
+    if (!masterFile.filepath || !businessFile.filepath) {
+      return res.status(400).json({ error: 'File upload failed: missing file path.' });
+    }
+
+    // Helper to upload a file buffer to Supabase Storage
+    async function uploadToSupabase(file: File, bucket: string, keyPrefix: string) {
+      const fileBuffer = fs.readFileSync(file.filepath);
+      const fileExt = file.originalFilename?.split('.').pop() || 'pdf';
+      const fileName = `${keyPrefix}_${Date.now()}.${fileExt}`;
+      const { data, error } = await supabaseServiceRole.storage.from(bucket).upload(fileName, fileBuffer, {
+        contentType: file.mimetype || 'application/pdf',
+        upsert: false,
+      });
+      if (error) throw error;
+      return data?.path || fileName;
+    }
+
+    const bucket = 'playbooks'; // Make sure this bucket exists in your Supabase project
+    // 1. Upload to Supabase Storage
+    const masterSupabaseId = await uploadToSupabase(masterFile, bucket, 'master');
+    const businessSupabaseId = await uploadToSupabase(businessFile, bucket, 'business');
+    // 2. Upload to OpenAI
+    const masterOpenAIId = await uploadToOpenAI(masterFile);
+    const businessOpenAIId = await uploadToOpenAI(businessFile);
+
+    return res.status(200).json({
+      masterSupabaseId,
+      businessSupabaseId,
+      masterOpenAIId,
+      businessOpenAIId
+    });
+  } catch (err: any) {
+    console.error('Upload error', err);
+    return res.status(500).json({ error: err.message || 'Upload failed' });
+  }
+}
+
